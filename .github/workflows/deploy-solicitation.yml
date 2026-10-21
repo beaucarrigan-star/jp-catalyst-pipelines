@@ -67,6 +67,7 @@ jobs:
         working-directory: build
         env:
           CATALYST_TOKEN: ${{ secrets.CATALYST_TOKEN }}
+          CATALYST_ORG: ${{ secrets.CATALYST_ORG }}
         run: |
           catalyst config:set python3_9.bin="$(which python)"
-          catalyst deploy --only functions --project "$CATALYST_PROJECT_ID" --token "$CATALYST_TOKEN"
+          catalyst deploy --only functions --project "$CATALYST_PROJECT_ID" --org "$CATALYST_ORG" --token "$CATALYST_TOKEN"
