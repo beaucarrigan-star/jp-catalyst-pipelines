@@ -1,0 +1,72 @@
+name: Deploy solicitation pipeline
+
+on:
+  push:
+    branches: [main]
+    paths: ["solicitation-pipeline/**", "ci/**", ".github/workflows/deploy-solicitation.yml"]
+  workflow_dispatch:        # the "Run workflow" button (and the optional Zoho button) uses this
+
+concurrency: deploy-solicitation
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      CATALYST_PROJECT_ID: "31190000000033001"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"          # Catalyst packages python_3_9 functions
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install tools
+        run: |
+          npm install -g zcatalyst-cli
+          catalyst --version
+          python -m pip install --quiet reportlab pdfminer.six==20250506
+
+      - name: Offline tests (a failure stops the deploy)
+        working-directory: solicitation-pipeline
+        run: |
+          for t in test_pipeline.py test_ingest_flow.py test_scoring_engine.py test_rule_ingest.py; do
+            python "tests/$t"
+          done
+
+      - name: Build
+        run: |
+          rm -rf build && mkdir -p build
+          cp solicitation-pipeline/catalyst.json build/
+          cp -r solicitation-pipeline/functions build/functions
+          for fn in sol_api sol_worker; do
+            cp -r solicitation-pipeline/solpipe "build/functions/$fn/solpipe"
+            # Linux wheels for Catalyst's python_3_9 stack (pdfminer.six needs compiled cryptography)
+            python -m pip install --quiet --target "build/functions/$fn" \
+              --platform manylinux2014_x86_64 --python-version 3.9 --implementation cp \
+              --only-binary=:all: --no-warn-conflicts "pdfminer.six==20250506"
+            rm -rf "build/functions/$fn/bin"
+            find "build/functions/$fn" -type d -name __pycache__ -prune -exec rm -rf {} +
+          done
+
+      - name: Inject credentials
+        env:
+          ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
+          ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+          ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+          ZOHO_ACCOUNTS_URL: ${{ secrets.ZOHO_ACCOUNTS_URL }}
+          ZOHO_API_DOMAIN: ${{ secrets.ZOHO_API_DOMAIN }}
+          PIPELINE_TOKEN: ${{ secrets.SOL_PIPELINE_TOKEN }}
+        run: python ci/inject_env.py solicitation build
+
+      - name: Deploy to Catalyst
+        working-directory: build
+        env:
+          CATALYST_TOKEN: ${{ secrets.CATALYST_TOKEN }}
+        run: |
+          catalyst config:set python3_9.bin="$(which python)"
+          catalyst deploy --only functions --project "$CATALYST_PROJECT_ID" --token "$CATALYST_TOKEN"

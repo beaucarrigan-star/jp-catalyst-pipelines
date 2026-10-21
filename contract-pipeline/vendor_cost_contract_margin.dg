@@ -1,0 +1,904 @@
+/*
+ * vendor_cost_contract_margin  (v5, 9 Oct 2026 - customer rates from Rate Lines)
+ * ------------------------------------------------
+ * v5: section 2 prices each customer contract from its live "Customer rate" Rate Lines
+ *     (not superseded/rejected, effective). The old Rates and Devices fields are read only for a
+ *     contract with no live customer line, and are being retired. Lines over $100/day are
+ *     treated as one-time charges and left out. A line's Rate_Terms mentioning purchased/owned
+ *     prices it against the monitoring-only vendor line.
+ *
+ * (v4, 28 Sep 2026 - Pricing Studio review)
+ * ------------------------------------------------
+ * v4: volume tiers apply to ALLIED ONLY. The tier volume is Allied's leased 1-Piece GPS on
+ *     leg, but v3 tiered any vendor line with Tier_Min_Units - so SuperCom's "Victim / DV,
+ *     1+ units" line (2025 reseller agreement ingest) was tiered by Allied's count and
+ *     auto-wrote Cost_Lease_Daily = 1.50 with Cost_Source "Auto: Allied tier ...". Other
+ *     vendors' tiered lines are now plain candidates for the exact-match check, and stale
+ *     Tier_Volume / Tier_Volume_Date / "Auto: Allied tier" Cost_Source on non-tiered
+ *     products are cleared.
+ *
+ * Automation function (no arguments). Run by two workflow rules:
+ *   - Products, on edit (vendor cost / vendor / device changed)
+ *   - Contracts, on create or edit (customer rates or vendor Rate Lines changed;
+ *     the Contract Review "Verify" button is a Contracts edit, so it fires this too)
+ * Recomputes everything each run (12 products, ~90 contracts), and only writes
+ * records whose values changed. bulkUpdate does not fire workflows, so no loop.
+ *
+ * 1. Vendor cost check (Products)
+ *    Cost_Lease_Daily (entered in the Pricing Studio) is compared with every
+ *    CURRENT "Vendor cost" Rate Line on that vendor's Contracts (Counterparty_Type =
+ *    Vendor, not Ended) for the product's Contract_Rate_Device.
+ *    CURRENT (v3): Superseded_By empty (skips lines superseded by a later document and
+ *    lines rejected in the Contract Review, whose Superseded_By = "Rejected in review"),
+ *    and Effective_Date empty or not in the future.
+ *    Exact to the cent; a match against ANY of the vendor's contracts passes.
+ *    A CAM product is checked against both CAM and CAM Landline lines.
+ *    TIERS (v2, Allied only from v4): Allied Rate Lines with Tier_Min_Units/Tier_Max_Units are
+ *    volume tiers. The tier is set by the devices active on the latest Daily Unit Counts day
+ *    (leased AT1 1-Piece GPS on leg, excluding Sheboygan County Sheriff). The current tier's rate
+ *    is written to Cost_Lease_Daily automatically (Cost_Source says "Auto: ..."), plus Tier_Volume,
+ *    Tier_Volume_Date, Current_Tier, Current_Tier_Rate.
+ *    CUSTOMER PRICING: a vendor Contract with an Account holds vendor rates for that customer
+ *    only (Sheboygan); customer contracts on that Account use those rates for margin.
+ *    Writes Contract_Check, Vendor_Contract_Rate, Contract_Check_Detail,
+ *    Contract_Checked_On.
+ *
+ * 2. Contract margin (customer Contracts)
+ *    Each customer rate field maps to one product. Margin/day = rate - cost,
+ *    margin % = margin / rate. Tier from the LOWEST device margin:
+ *    Negative < 0, Thin < 20, Normal 20-50, Strong > 50 (same bands as EM Margin).
+ *    COST-PLUS (v3): Rate_Basis = "Cost-plus" -> Cost-plus, with Admin_Rate_Pct in the
+ *    detail when set. Rate_Basis blank falls back to the old "Cost +" Rate Notes sniff;
+ *    any other Rate_Basis value wins over the sniff.
+ *    PURCHASED UNITS (v3): Rate_Basis = "Purchased units" -> the rate is a monitoring-only
+ *    rate on JP-owned units, so it is priced against a current vendor line whose Rate_Terms
+ *    mention "purchased" or "monitoring" for that device, never the lease cost; with no such
+ *    line it is left out of the margin (not read as Negative) and the detail says why.
+ *    No rate fields -> No rates. Rates but no costs -> No cost data.
+ *    Margin_Cost_Check: Cost differs (any device whose cost differs from, or is
+ *    not in, the vendor contract) > Missing vendor cost > Costs match contracts.
+ *
+ * 3. Billing Vendor_Rates (v3)
+ *    Each Vendor_Rates row with a Contract lookup and a mapped Device_Type is pointed at that
+ *    contract's current VERIFIED Rate Line (Line_Verified, not superseded, flat - no tier;
+ *    purchased rows match "purchased" lines, others the rest). When found: Active_Rate = line
+ *    amount, Confirmation = Contract-confirmed, Source = "Contract: <name> - <Source_Ref>".
+ *    Rows without a Contract, or without a verified line, are left exactly as they are.
+ *    The billing worker lays Vendor_Rates over rate_card.csv on its next run.
+ */
+void automation.vendor_cost_contract_margin()
+{
+	today = zoho.currentdate;
+	todayStr = today.toString("yyyy-MM-dd");
+	nl = zoho.encryption.urlDecode("%0A");
+	// the only vendor whose Rate Line tiers follow the Daily Unit Counts tier volume
+	alliedId = "6715134000002099249";
+	// ---------- customer rate field -> product id ----------
+	rateMap = Map();
+	rateMap.put("GPS_Rate_Allied","6715134000001947549");
+	rateMap.put("RB_Rate_Attenti","6715134000000750055");
+	rateMap.put("CAM_Rate_AMS","6715134000000750045");
+	rateMap.put("RB_Rate_AMS","6715134000000750050");
+	rateMap.put("Piece_Rate_Allied","6715134000006353122");
+	rateMap.put("Buddi_Hybrid_Rate","6715134000000657001");
+	rateMap.put("Wrist_Worn_GPS_Rate","6715134000006353123");
+	rateMap.put("Supercom_GPS_Rate","6715134000000750065");
+	rateMap.put("Supercom_Victim_Rate","6715134000000750060");
+	rateLabel = Map();
+	rateLabel.put("GPS_Rate_Allied","GPS (Allied)");
+	rateLabel.put("RB_Rate_Attenti","RB (Attenti)");
+	rateLabel.put("CAM_Rate_AMS","CAM (AMS)");
+	rateLabel.put("RB_Rate_AMS","RB (AMS)");
+	rateLabel.put("Piece_Rate_Allied","2-Piece (Allied)");
+	rateLabel.put("Buddi_Hybrid_Rate","Buddi Hybrid");
+	rateLabel.put("Wrist_Worn_GPS_Rate","Wrist Worn GPS");
+	rateLabel.put("Supercom_GPS_Rate","Supercom GPS");
+	rateLabel.put("Supercom_Victim_Rate","Supercom Victim");
+	// ---------- read all contracts once ----------
+	allContracts = List();
+	for each  pageNo in {1,2,3,4,5}
+	{
+		recs = zoho.crm.getRecords("Contracts",pageNo,200);
+		allContracts.addAll(recs);
+		if(recs.size() < 200)
+		{
+			break;
+		}
+	}
+	// ---------- vendor contract rate lines ----------
+	// vendorRates:  "vendorId|device"            -> list (general vendor pricing, vendor contract has no Account)
+	// custRates:    "accountId|vendorId|device"  -> list (customer-specific vendor pricing, e.g. Sheboygan)
+	// monitorRates: "vendorId|device"            -> list (monitoring-only lines for JP-owned units)
+	// An Allied line with Tier_Min_Units set is a volume tier; the tier is picked by the day's active-device count.
+	vendorRates = Map();
+	custRates = Map();
+	monitorRates = Map();
+	fullById = Map();
+	for each  c in allContracts
+	{
+		if(ifnull(c.get("Counterparty_Type"),"") == "Vendor" && ifnull(c.get("Contract_Status"),"") != "Ended")
+		{
+			full = zoho.crm.getRecordById("Contracts",c.get("id").toLong());
+			fullById.put(c.get("id").toString(),full);
+			lines = ifnull(full.get("Rate_Lines"),List());
+			parentVendor = "";
+			if(full.get("Vendor") != null)
+			{
+				parentVendor = full.get("Vendor").get("id").toString();
+			}
+			acctId = "";
+			if(full.get("Account") != null)
+			{
+				acctId = full.get("Account").get("id").toString();
+			}
+			for each  ln in lines
+			{
+				amt = ln.get("Rate_Daily_Amount");
+				live = ifnull(ln.get("Superseded_By"),"") == "";
+				if(live && ln.get("Effective_Date") != null && ln.get("Effective_Date") != "")
+				{
+					if(ln.get("Effective_Date").toDate() > today)
+					{
+						live = false;
+					}
+				}
+				if(live && ifnull(ln.get("Rate_Type"),"") == "Vendor cost" && amt != null && ln.get("Rate_Device") != null)
+				{
+					vid = parentVendor;
+					if(ln.get("Rate_Vendor") != null)
+					{
+						vid = ln.get("Rate_Vendor").get("id").toString();
+					}
+					entry = Map();
+					entry.put("amt",amt.toDecimal());
+					src = full.get("Name");
+					terms = ifnull(ln.get("Rate_Terms"),"");
+					if(terms != "")
+					{
+						src = src + " (" + terms + ")";
+					}
+					entry.put("src",src);
+					entry.put("min",ln.get("Tier_Min_Units"));
+					entry.put("max",ln.get("Tier_Max_Units"));
+					tl = terms.toLowerCase();
+					if(tl.contains("purchased") || tl.contains("monitoring"))
+					{
+						k = vid + "|" + ln.get("Rate_Device");
+						lst = ifnull(monitorRates.get(k),List());
+						lst.add(entry);
+						monitorRates.put(k,lst);
+					}
+					else if(acctId != "")
+					{
+						k = acctId + "|" + vid + "|" + ln.get("Rate_Device");
+						lst = ifnull(custRates.get(k),List());
+						lst.add(entry);
+						custRates.put(k,lst);
+					}
+					else
+					{
+						k = vid + "|" + ln.get("Rate_Device");
+						lst = ifnull(vendorRates.get(k),List());
+						lst.add(entry);
+						vendorRates.put(k,lst);
+					}
+				}
+			}
+		}
+	}
+	// ---------- tier volume: devices active on the latest Daily Unit Counts day ----------
+	// Allied bills 1-Piece GPS at the tier set by the number of devices active each day.
+	// Counted: leased AT1 (1-Piece) GPS on leg, excluding Sheboygan County Sheriff (Addendum 23
+	// excludes it from tiered pricing; it has its own vendor contract).
+	tierVol = null;
+	tierDate = null;
+	for each  back in {0,1,2,3,4,5,6,7}
+	{
+		if(tierVol == null)
+		{
+			d = zoho.currentdate.subDay(back).toString("yyyy-MM-dd");
+			vol = 0;
+			found = 0;
+			for each  pg in {1,2,3}
+			{
+				rows = zoho.crm.searchRecords("Daily_Unit_Counts","(Count_Date:equals:" + d + ")",pg,200);
+				for each  r in rows
+				{
+					found = found + 1;
+					hw = ifnull(r.get("Hardware_Version"),"");
+					cust = ifnull(r.get("SmartView_Customer"),"");
+					if(ifnull(r.get("Device_Family"),"") == "GPS" && ifnull(r.get("Acquisition"),"") == "Leased" && hw.startsWith("AT1") && !cust.contains("Sheboygan County Sheriff"))
+					{
+						vol = vol + ifnull(r.get("On_Leg"),0).toLong();
+					}
+				}
+				if(rows.size() < 200)
+				{
+					break;
+				}
+			}
+			if(found > 0)
+			{
+				tierVol = vol;
+				tierDate = d;
+			}
+		}
+	}
+	// ---------- 1. product checks ----------
+	prodInfo = Map();
+	prodUpdates = List();
+	products = zoho.crm.getRecords("Products",1,200);
+	for each  p in products
+	{
+		if(p.get("Product_Active") == true)
+		{
+			pid = p.get("id").toString();
+			cost = p.get("Cost_Lease_Daily");
+			vid = "";
+			if(p.get("Vendor_Name") != null)
+			{
+				vid = p.get("Vendor_Name").get("id").toString();
+			}
+			dev = ifnull(p.get("Contract_Rate_Device"),"");
+			cands = List();
+			cands.addAll(ifnull(vendorRates.get(vid + "|" + dev),List()));
+			// a CAM product is checked against both wireless (CAM) and landline Rate Lines
+			if(dev == "CAM")
+			{
+				cands.addAll(ifnull(vendorRates.get(vid + "|CAM Landline"),List()));
+			}
+			// tiered lines -> pick the tier for today's volume (Allied only: the volume is Allied's count)
+			tiered = false;
+			tierLine = null;
+			for each  cd in cands
+			{
+				if(cd.get("min") != null && vid == alliedId)
+				{
+					tiered = true;
+					if(tierVol != null)
+					{
+						if(tierVol >= cd.get("min").toLong() && (cd.get("max") == null || tierVol <= ifnull(cd.get("max"),0).toLong()))
+						{
+							tierLine = cd;
+						}
+					}
+				}
+			}
+			tierLabel = null;
+			tierRate = null;
+			row = Map();
+			autoSet = false;
+			if(tierLine != null)
+			{
+				tierRate = tierLine.get("amt");
+				tierLabel = tierLine.get("min").toString() + "+";
+				if(tierLine.get("max") != null)
+				{
+					tierLabel = tierLine.get("min").toString() + "-" + tierLine.get("max").toString();
+				}
+				tierLabel = tierLabel + " units/day";
+				// the tier rate drives the cost (Beau's choice, 26 Sep 2026)
+				if(cost == null)
+				{
+					cost = tierRate;
+					autoSet = true;
+				}
+				else if((cost.toDecimal() * 100).round(0) != (tierRate * 100).round(0))
+				{
+					cost = tierRate;
+					autoSet = true;
+				}
+			}
+			pstatus = "";
+			ref = null;
+			detail = "";
+			for each  cd in cands
+			{
+				s = cd.get("amt").round(2).toString();
+				if(!s.contains("."))
+				{
+					s = s + ".00";
+				}
+				else if(s.getSuffix(".").length() == 1)
+				{
+					s = s + "0";
+				}
+				mark = "";
+				if(tierLine != null)
+				{
+					if(cd.get("src") == tierLine.get("src"))
+					{
+						mark = "  <- current tier";
+					}
+				}
+				detail = detail + cd.get("src") + ": $" + s + mark + nl;
+			}
+			if(tiered)
+			{
+				if(tierVol != null)
+				{
+					detail = detail + "Tier volume: " + tierVol + " active devices on " + tierDate + " (leased 1-Piece GPS on leg, excl. Sheboygan County Sheriff)." + nl;
+				}
+				else
+				{
+					detail = detail + "No Daily Unit Counts in the last 8 days, so the tier could not be set; checked against any tier." + nl;
+				}
+			}
+			if(cost == null)
+			{
+				pstatus = "No cost entered";
+				if(cands.size() > 0)
+				{
+					ref = cands.get(0).get("amt");
+				}
+			}
+			else if(cands.size() == 0)
+			{
+				pstatus = "No contract rate";
+				detail = "No Vendor cost Rate Line for " + ifnull(p.get("Contract_Rate_Device"),"(no device set)") + " on this vendor's Contracts.";
+			}
+			else if(tierLine != null)
+			{
+				ref = tierRate;
+				pstatus = "Matches contract";
+			}
+			else
+			{
+				costC = (cost.toDecimal() * 100).round(0);
+				pstatus = "Differs from contract";
+				bestGap = 999999;
+				for each  cd in cands
+				{
+					gap = cd.get("amt") * 100 - costC;
+					if(gap < 0)
+					{
+						gap = 0 - gap;
+					}
+					if(gap < 0.5)
+					{
+						pstatus = "Matches contract";
+						ref = cd.get("amt");
+						bestGap = -1;
+					}
+					else if(bestGap >= 0 && gap < bestGap)
+					{
+						bestGap = gap;
+						ref = cd.get("amt");
+					}
+				}
+			}
+			detail = detail.trim();
+			pinfo = Map();
+			pinfo.put("name",p.get("Product_Name"));
+			pinfo.put("cost",cost);
+			pinfo.put("check",pstatus);
+			pinfo.put("ref",ref);
+			pinfo.put("vid",vid);
+			pinfo.put("dev",dev);
+			prodInfo.put(pid,pinfo);
+			oldRef = p.get("Vendor_Contract_Rate");
+			changed = autoSet;
+			if(ifnull(p.get("Contract_Check"),"") != pstatus || ifnull(p.get("Contract_Check_Detail"),"") != detail || ifnull(oldRef,-1).toDecimal() != ifnull(ref,-1).toDecimal() || p.get("Contract_Checked_On") == null)
+			{
+				changed = true;
+			}
+			if(ifnull(p.get("Current_Tier"),"") != ifnull(tierLabel,"") || ifnull(p.get("Current_Tier_Rate"),-1).toDecimal() != ifnull(tierRate,-1).toDecimal())
+			{
+				changed = true;
+			}
+			// v4: a non-tiered product must not keep a tier volume or an "Auto: Allied tier" source from an earlier run
+			staleSource = !tiered && ifnull(p.get("Cost_Source"),"").startsWith("Auto: Allied tier");
+			if(tiered)
+			{
+				if(ifnull(p.get("Tier_Volume"),-1).toLong() != ifnull(tierVol,-1).toLong())
+				{
+					changed = true;
+				}
+			}
+			else if(p.get("Tier_Volume") != null || p.get("Tier_Volume_Date") != null || staleSource)
+			{
+				changed = true;
+			}
+			if(changed)
+			{
+				row.put("id",pid);
+				row.put("Contract_Check",pstatus);
+				row.put("Vendor_Contract_Rate",ref);
+				row.put("Contract_Check_Detail",detail);
+				row.put("Contract_Checked_On",todayStr);
+				row.put("Current_Tier",tierLabel);
+				row.put("Current_Tier_Rate",tierRate);
+				if(tiered)
+				{
+					row.put("Tier_Volume",tierVol);
+					row.put("Tier_Volume_Date",tierDate);
+				}
+				else
+				{
+					row.put("Tier_Volume",null);
+					row.put("Tier_Volume_Date",null);
+				}
+				if(staleSource)
+				{
+					row.put("Cost_Source","Cost set by an earlier tier run - please confirm (" + todayStr + ")");
+				}
+				if(autoSet)
+				{
+					row.put("Cost_Lease_Daily",tierRate);
+					row.put("Cost_Source","Auto: Allied tier " + tierLabel + " at " + tierVol + " active devices (" + tierDate + ")");
+					row.put("Cost_Updated",todayStr);
+				}
+				prodUpdates.add(row);
+			}
+		}
+	}
+	if(prodUpdates.size() > 0)
+	{
+		zoho.crm.bulkUpdate("Products",prodUpdates);
+	}
+	// ---------- 2. customer contract margins ----------
+	// v5 (9 Oct 2026): customer rates come from the contract's live "Customer rate" Rate Lines. The old
+	// per-device rate fields (Rates and Devices section) are read only when a contract has no live customer
+	// line; they are being retired. A line over $100/day is treated as a one-time charge, not a daily rate.
+	vendorKey = Map();
+	vendorKey.put("6715134000002099249","Allied");
+	vendorKey.put("6715134000000625017","SCRAM");
+	vendorKey.put("6715134000000625022","SuperCom");
+	vendorKey.put("6715134000000625027","Buddi");
+	lineProd = Map();
+	lineProd.put("GPS|Allied","6715134000001947549");
+	lineProd.put("Remote Breath|Allied","6715134000000750055");
+	lineProd.put("CAM|SCRAM","6715134000000750045");
+	lineProd.put("CAM Landline|SCRAM","6715134000000750045");
+	lineProd.put("Remote Breath|SCRAM","6715134000000750050");
+	lineProd.put("2-Piece GPS|Allied","6715134000006353122");
+	lineProd.put("Hybrid GPS + Alcohol|Buddi","6715134000000657001");
+	lineProd.put("GPS|SuperCom","6715134000000750065");
+	lineProd.put("Victim / DV|SuperCom","6715134000000750060");
+	// a line with no Rate Vendor: the usual vendor for that device
+	lineProdAny = Map();
+	lineProdAny.put("GPS","6715134000001947549");
+	lineProdAny.put("Remote Breath","6715134000000750055");
+	lineProdAny.put("CAM","6715134000000750045");
+	lineProdAny.put("CAM Landline","6715134000000750045");
+	lineProdAny.put("2-Piece GPS","6715134000006353122");
+	lineProdAny.put("Hybrid GPS + Alcohol","6715134000000657001");
+	lineProdAny.put("Wrist-worn GPS","6715134000006353123");
+	lineProdAny.put("Victim / DV","6715134000000750060");
+	custLines = Map();
+	for each  pg in {1,2,3,4,5}
+	{
+		rl = zoho.crm.getRecords("Rate_Lines",pg,200);
+		for each  ln in rl
+		{
+			if(ifnull(ln.get("Rate_Type"),"") == "Customer rate" && ifnull(ln.get("Superseded_By"),"") == "" && ln.get("Rate_Daily_Amount") != null && ln.get("Parent_Id") != null)
+			{
+				liveL = true;
+				if(ln.get("Effective_Date") != null && ln.get("Effective_Date") != "")
+				{
+					if(ln.get("Effective_Date").toDate() > today)
+					{
+						liveL = false;
+					}
+				}
+				if(liveL)
+				{
+					pk = ln.get("Parent_Id").get("id").toString();
+					lst = ifnull(custLines.get(pk),List());
+					lst.add(ln);
+					custLines.put(pk,lst);
+				}
+			}
+		}
+		if(rl.size() < 200)
+		{
+			break;
+		}
+	}
+	conUpdates = List();
+	for each  c in allContracts
+	{
+		if(ifnull(c.get("Counterparty_Type"),"") != "Vendor")
+		{
+			notes = ifnull(c.get("Rate_Notes"),"").toLowerCase();
+			basis = ifnull(c.get("Rate_Basis"),"");
+			if(basis == "-None-")
+			{
+				basis = "";
+			}
+			// v3: Rate_Basis (written by contract ingest, confirmed in review) wins; blank falls back to the text sniff
+			if(basis != "")
+			{
+				costPlus = basis == "Cost-plus";
+			}
+			else
+			{
+				costPlus = notes.contains("cost +") || notes.contains("cost+");
+			}
+			purchased = basis == "Purchased units";
+			// ---- the rates to price: Rate Lines first, old fields as fallback ----
+			items = List();
+			cl = ifnull(custLines.get(c.get("id").toString()),List());
+			fromLines = cl.size() > 0;
+			if(fromLines)
+			{
+				for each  ln in cl
+				{
+					dev = ifnull(ln.get("Rate_Device"),"");
+					vn = "";
+					if(ln.get("Rate_Vendor") != null)
+					{
+						vn = ifnull(vendorKey.get(ln.get("Rate_Vendor").get("id").toString()),"");
+					}
+					pidL = null;
+					if(vn != "")
+					{
+						pidL = lineProd.get(dev + "|" + vn);
+					}
+					if(pidL == null)
+					{
+						pidL = lineProdAny.get(dev);
+					}
+					terms = ifnull(ln.get("Rate_Terms"),"");
+					lbl = dev;
+					if(vn != "")
+					{
+						lbl = dev + " (" + vn + ")";
+					}
+					tl = terms.toLowerCase();
+					if(tl.contains("purchased") || tl.contains("owned"))
+					{
+						lbl = lbl + " purchased";
+					}
+					it = Map();
+					it.put("label",lbl);
+					it.put("rate",ln.get("Rate_Daily_Amount").toDecimal());
+					it.put("pid",ifnull(pidL,""));
+					it.put("bought",tl.contains("purchased") || tl.contains("owned"));
+					items.add(it);
+				}
+			}
+			else
+			{
+				for each  f in rateMap.keys()
+				{
+					rv = c.get(f);
+					if(rv != null && rv.toDecimal() > 0)
+					{
+						it = Map();
+						it.put("label",rateLabel.get(f));
+						it.put("rate",rv.toDecimal());
+						it.put("pid",rateMap.get(f));
+						it.put("bought",false);
+						items.add(it);
+					}
+				}
+			}
+			nRates = 0;
+			nPriced = 0;
+			lowest = null;
+			sumPct = 0;
+			anyDiff = false;
+			anyMissing = false;
+			detail = "";
+			if(items.size() > 0)
+			{
+				if(fromLines)
+				{
+					detail = "Rates from this contract's Rate Lines." + nl;
+				}
+				else
+				{
+					detail = "Rates from the old rate fields (no customer Rate Lines yet)." + nl;
+				}
+			}
+			for each  it in items
+			{
+				rate = it.get("rate");
+				rs = rate.round(2).toString();
+				if(!rs.contains("."))
+				{
+					rs = rs + ".00";
+				}
+				else if(rs.getSuffix(".").length() == 1)
+				{
+					rs = rs + "0";
+				}
+				if(rate > 100)
+				{
+					detail = detail + it.get("label") + ": $" + rs + " looks like a one-time charge, not a daily rate - left out" + nl;
+				}
+				else
+				{
+					nRates = nRates + 1;
+					pi = null;
+					if(it.get("pid") != "")
+					{
+						pi = prodInfo.get(it.get("pid"));
+					}
+					pname = "no matching product";
+					cost = null;
+					chk = "";
+					skipLine = false;
+					lineBought = purchased || it.get("bought") == true;
+					if(pi != null)
+					{
+						pname = pi.get("name");
+						cost = pi.get("cost");
+						chk = pi.get("check");
+						// customer-specific vendor pricing (vendor contract whose Account is this customer)
+						if(c.get("Account") != null)
+						{
+							ck = c.get("Account").get("id").toString() + "|" + pi.get("vid") + "|" + pi.get("dev");
+							cpl = ifnull(custRates.get(ck),List());
+							if(cpl.size() > 0)
+							{
+								cost = cpl.get(0).get("amt");
+								chk = "Customer-specific";
+								pname = pname + " [customer pricing: " + cpl.get(0).get("src") + "]";
+							}
+						}
+						// purchased units: price against the monitoring-only vendor line, never the lease cost
+						if(lineBought)
+						{
+							ml = ifnull(monitorRates.get(pi.get("vid") + "|" + pi.get("dev")),List());
+							if(ml.size() > 0)
+							{
+								cost = ml.get(0).get("amt");
+								chk = "Monitoring-only";
+								pname = pname + " [monitoring-only: " + ml.get(0).get("src") + "]";
+							}
+							else
+							{
+								skipLine = true;
+							}
+						}
+					}
+					if(skipLine)
+					{
+						detail = detail + it.get("label") + " -> " + pname + ": rate $" + rs + " on JP-owned (purchased) units; no monitoring-only vendor line, so left out of the margin" + nl;
+					}
+					else if(cost == null)
+					{
+						anyMissing = true;
+						detail = detail + it.get("label") + " -> " + pname + ": rate $" + rs + ", no vendor cost entered" + nl;
+					}
+					else
+					{
+						cost = cost.toDecimal();
+						m = rate - cost;
+						pct = (m / rate * 1000).round(0) / 10;
+						nPriced = nPriced + 1;
+						sumPct = sumPct + m / rate * 100;
+						if(lowest == null)
+						{
+							lowest = pct;
+						}
+						else if(pct < lowest)
+						{
+							lowest = pct;
+						}
+						cs = cost.round(2).toString();
+						if(!cs.contains("."))
+						{
+							cs = cs + ".00";
+						}
+						else if(cs.getSuffix(".").length() == 1)
+						{
+							cs = cs + "0";
+						}
+						mabs = m;
+						msign = "";
+						if(m < 0)
+						{
+							mabs = 0 - m;
+							msign = "-";
+						}
+						ms = mabs.round(2).toString();
+						if(!ms.contains("."))
+						{
+							ms = ms + ".00";
+						}
+						else if(ms.getSuffix(".").length() == 1)
+						{
+							ms = ms + "0";
+						}
+						flag = "";
+						if(chk == "Differs from contract")
+						{
+							flag = "  [cost differs from vendor contract]";
+							anyDiff = true;
+						}
+						else if(chk == "No contract rate")
+						{
+							flag = "  [cost not in a vendor contract]";
+							anyDiff = true;
+						}
+						detail = detail + it.get("label") + " -> " + pname + ": rate $" + rs + " - cost $" + cs + " = " + msign + "$" + ms + "/day (" + pct + "%)" + flag + nl;
+					}
+				}
+			}
+			if(nRates > 0 && !fromLines && !purchased && (notes.contains("purchas") || notes.contains("owned")))
+			{
+				detail = detail + "Note: Rate Notes mention purchased/owned units; margin above uses the vendor lease cost." + nl;
+			}
+			tier = "";
+			avg = null;
+			if(costPlus)
+			{
+				tier = "Cost-plus";
+				if(basis == "Cost-plus")
+				{
+					adminTxt = "";
+					if(c.get("Admin_Rate_Pct") != null)
+					{
+						adminTxt = " of " + c.get("Admin_Rate_Pct") + "%";
+					}
+					detail = detail + "Cost-plus contract (Rate Basis); margin is the contracted admin rate" + adminTxt + "." + nl;
+				}
+				else
+				{
+					detail = detail + "Cost-plus contract (Rate Notes: " + c.get("Rate_Notes") + "); margin is the contracted admin rate." + nl;
+				}
+			}
+			else if(nRates == 0)
+			{
+				tier = "No rates";
+			}
+			else if(nPriced == 0)
+			{
+				tier = "No cost data";
+			}
+			else
+			{
+				if(lowest < 0)
+				{
+					tier = "Negative";
+				}
+				else if(lowest < 20)
+				{
+					tier = "Thin";
+				}
+				else if(lowest <= 50)
+				{
+					tier = "Normal";
+				}
+				else
+				{
+					tier = "Strong";
+				}
+			}
+			if(nPriced > 0 && !costPlus)
+			{
+				avg = (sumPct / nPriced * 10).round(0) / 10;
+			}
+			else
+			{
+				lowest = null;
+			}
+			cchk = null;
+			if(nRates > 0 && !costPlus)
+			{
+				if(anyDiff)
+				{
+					cchk = "Cost differs";
+				}
+				else if(anyMissing)
+				{
+					cchk = "Missing vendor cost";
+				}
+				else
+				{
+					cchk = "Costs match contracts";
+				}
+			}
+			detail = detail.trim();
+			if(ifnull(c.get("Margin_Tier"),"") != tier || ifnull(c.get("Margin_Cost_Check"),"") != ifnull(cchk,"") || ifnull(c.get("Margin_Detail"),"") != detail || ifnull(c.get("Lowest_Margin"),-999).toDecimal() != ifnull(lowest,-999).toDecimal() || ifnull(c.get("Average_Margin"),-999).toDecimal() != ifnull(avg,-999).toDecimal() || c.get("Margin_Updated") == null)
+			{
+				row = Map();
+				row.put("id",c.get("id"));
+				row.put("Margin_Tier",tier);
+				row.put("Margin_Cost_Check",cchk);
+				row.put("Margin_Detail",detail);
+				row.put("Lowest_Margin",lowest);
+				row.put("Average_Margin",avg);
+				row.put("Margin_Updated",todayStr);
+				conUpdates.add(row);
+			}
+		}
+	}
+	block = List();
+	for each  u in conUpdates
+	{
+		block.add(u);
+		if(block.size() == 100)
+		{
+			zoho.crm.bulkUpdate("Contracts",block);
+			block = List();
+		}
+	}
+	if(block.size() > 0)
+	{
+		zoho.crm.bulkUpdate("Contracts",block);
+	}
+	// ---------- 3. billing Vendor_Rates -> verified contract lines ----------
+	devMap = Map();
+	devMap.put("1 Piece GPS (AT1)","GPS");
+	devMap.put("GPS","GPS");
+	devMap.put("Remote Breath","Remote Breath");
+	devMap.put("CAM","CAM");
+	devMap.put("CAM Landline","CAM Landline");
+	vrUpdates = List();
+	vrRows = zoho.crm.getRecords("Vendor_Rates",1,200);
+	for each  vr in vrRows
+	{
+		dt = ifnull(vr.get("Device_Type"),"");
+		if(vr.get("Contract") != null && devMap.containsKey(dt))
+		{
+			cid = vr.get("Contract").get("id").toString();
+			full = fullById.get(cid);
+			if(full == null)
+			{
+				full = zoho.crm.getRecordById("Contracts",cid.toLong());
+				fullById.put(cid,full);
+			}
+			wantBought = ifnull(vr.get("Basis"),"") == "purchased";
+			best = null;
+			bestEff = null;
+			for each  ln in ifnull(full.get("Rate_Lines"),List())
+			{
+				ok = ln.get("Line_Verified") == true && ifnull(ln.get("Superseded_By"),"") == "" && ln.get("Tier_Min_Units") == null && ifnull(ln.get("Rate_Device"),"") == devMap.get(dt) && ln.get("Rate_Daily_Amount") != null;
+				if(ok)
+				{
+					isBought = ifnull(ln.get("Rate_Terms"),"").toLowerCase().contains("purchased");
+					ok = isBought == wantBought;
+				}
+				eff = null;
+				if(ok && ln.get("Effective_Date") != null && ln.get("Effective_Date") != "")
+				{
+					eff = ln.get("Effective_Date").toDate();
+					if(eff > today)
+					{
+						ok = false;
+					}
+				}
+				if(ok)
+				{
+					if(best == null)
+					{
+						best = ln;
+						bestEff = eff;
+					}
+					else if(eff != null && (bestEff == null || eff > bestEff))
+					{
+						best = ln;
+						bestEff = eff;
+					}
+				}
+			}
+			if(best != null)
+			{
+				newAmt = best.get("Rate_Daily_Amount").toDecimal();
+				newSrc = "Contract: " + full.get("Name") + " - " + ifnull(best.get("Source_Ref"),"verified in review");
+				if(newSrc.length() > 255)
+				{
+					newSrc = newSrc.subString(0,255);
+				}
+				if(ifnull(vr.get("Active_Rate"),-1).toDecimal() != newAmt || ifnull(vr.get("Confirmation"),"") != "Contract-confirmed" || ifnull(vr.get("Source"),"") != newSrc)
+				{
+					vrow = Map();
+					vrow.put("id",vr.get("id"));
+					vrow.put("Active_Rate",newAmt);
+					vrow.put("Confirmation","Contract-confirmed");
+					vrow.put("Source",newSrc);
+					vrUpdates.add(vrow);
+				}
+			}
+		}
+	}
+	if(vrUpdates.size() > 0)
+	{
+		zoho.crm.bulkUpdate("Vendor_Rates",vrUpdates);
+	}
+	info "vendor_cost_contract_margin v5: tier volume " + tierVol + " on " + tierDate + ", products updated " + prodUpdates.size() + ", contracts updated " + conUpdates.size() + ", vendor rates updated " + vrUpdates.size();
+}

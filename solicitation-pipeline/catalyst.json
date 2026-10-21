@@ -1,0 +1,7 @@
+{
+	"functions": {
+		"targets": ["sol_api", "sol_worker"],
+		"ignore": [],
+		"source": "functions"
+	}
+}

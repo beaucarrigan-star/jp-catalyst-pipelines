@@ -1,0 +1,44 @@
+// Replace the BODY of each existing button function with the matching block below.
+// Keep the function names and argument names exactly as they are, so the four
+// buttons and their merge-field arguments (already fixed Sep 16) keep working.
+// Setup > Developer Hub > Functions > (function) > Edit > paste > Save.
+
+// 1. Ingest Requirements   (button on Solicitations, argument solId -> Solicitation Id)
+string button.solicitation_ingest_requirements(String solId)
+{
+	return standalone.solicitation_pipeline_call("ingest",solId);
+}
+
+// 1b. Build Briefing     (NEW button on Solicitations, argument solId -> Solicitation Id)
+//     Function name: solicitation_build_briefing. Attaches a Word document to the record.
+string button.solicitation_build_briefing(String solId)
+{
+	return standalone.solicitation_pipeline_call("briefing",solId);
+}
+
+// 2. Seed Scorecard        (button on Bid Scenarios, argument scenarioId -> Bid Scenario Id)
+string button.solicitation_seed_scorecard(String scenarioId)
+{
+	return standalone.solicitation_pipeline_call("seed",scenarioId);
+}
+
+// 3. Generate Spec Matrix  (button on Bid Scenarios, argument scenarioId -> Bid Scenario Id)
+string button.solicitation_build_spec_matrix(String scenarioId)
+{
+	return standalone.solicitation_pipeline_call("matrix",scenarioId);
+}
+
+// 4. Re-score              (button on Bid Scenarios, argument scenarioId -> Bid Scenario Id)
+string button.solicitation_score_scenario(String scenarioId)
+{
+	return standalone.solicitation_pipeline_call("score",scenarioId);
+}
+
+// 5. Milestone alerts  (NEW standalone function; Setup > Automation > Schedules > daily 05:00 CT)
+string standalone.solicitation_milestone_alerts()
+{
+	return standalone.solicitation_pipeline_call("milestones","all");
+}
+
+// Before replacing, copy each current body into a text file named
+// <function>_deluge_backup.dg - it is the rollback if the Catalyst side is down.

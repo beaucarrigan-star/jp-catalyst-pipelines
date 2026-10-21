@@ -1,0 +1,21 @@
+# Code only. Business data and credentials never go to GitHub.
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+*.bak-*
+*.env
+.catalystrc
+build/
+
+# solicitation-pipeline: RFP packets and company documents
+solicitation-pipeline/*.pdf
+solicitation-pipeline/*.PDF
+solicitation-pipeline/*.docx
+solicitation-pipeline/*.xlsx
+
+# contract-pipeline: signed contracts, review outputs, real contract text used by the golden tests
+contract-pipeline/contracts/
+contract-pipeline/Claude outputs/
+contract-pipeline/tests/fixtures/
+contract-pipeline/*.pdf

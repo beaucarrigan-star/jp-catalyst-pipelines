@@ -1,0 +1,63 @@
+// Standalone function: solicitation_pipeline_call(String action, String recordId)
+// Setup > Developer Hub > Functions > + New Function > Category: Standalone
+// The ONE place the Catalyst URL and pipeline token live. The four button
+// functions below call this. Replace the two placeholders after deploy.
+string standalone.solicitation_pipeline_call(String action, String recordId)
+{
+	base = "<CATALYST_SOL_API_URL>";
+	token = "<PIPELINE_TOKEN>";
+	if(base.endsWith("/"))
+	{
+		base = base.subString(0,base.length() - 1);
+	}
+	url = base + "/run";
+	rid = recordId.trim();
+	if(rid.contains("%") || rid.contains("$") || rid == "")
+	{
+		return "The record id did not reach the function (received: " + rid + "). Re-pick the button argument as the record Id merge field.";
+	}
+	body = Map();
+	body.put("action",action);
+	body.put("record_id",rid);
+	hdr = Map();
+	hdr.put("Content-Type","application/json");
+	hdr.put("X-Pipeline-Token",token);
+	resp = invokeurl
+	[
+		url :url
+		type :POST
+		parameters:body.toString()
+		headers:hdr
+		detailed:true
+	];
+	code = resp.get("responseCode");
+	txt = resp.get("responseText");
+	msg = "";
+	if(txt != null)
+	{
+		msg = txt.toString();
+		try
+		{
+			m = txt.toString().toMap();
+			if(m != null && m.get("message") != null)
+			{
+				msg = m.get("message");
+			}
+		}
+		catch (e)
+		{
+			// not JSON (e.g. a gateway HTML error page) - keep the raw text, trimmed
+			if(msg.length() > 400)
+			{
+				msg = msg.subString(0,400);
+			}
+		}
+	}
+	if(code == null || code.toLong() >= 400)
+	{
+		// Keep the response visible; Deluge invokeurl does not throw on 4xx/5xx.
+		info resp;
+		return "Pipeline error (HTTP " + code + "): " + msg;
+	}
+	return msg;
+}

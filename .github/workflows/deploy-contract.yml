@@ -1,0 +1,83 @@
+name: Deploy contract pipeline
+
+on:
+  push:
+    branches: [main]
+    paths: ["contract-pipeline/**", "ci/**", ".github/workflows/deploy-contract.yml"]
+  workflow_dispatch:
+
+concurrency: deploy-contract
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CATALYST_PROJECT_ID: "31190000000040038"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install tools
+        run: |
+          npm install -g zcatalyst-cli
+          catalyst --version
+          python -m pip install --quiet pytest pdfplumber reportlab
+
+      # The golden tests read real vendor contract text from tests/fixtures. That folder is kept out of
+      # GitHub (see .gitignore), so here only the tests that need no fixtures can run. The full golden
+      # set runs on your PC with check-contracts.cmd before you push.
+      - name: Tests
+        working-directory: contract-pipeline
+        run: |
+          if [ -d tests/fixtures ]; then
+            python -m pytest tests -q -p no:cacheprovider
+          else
+            echo "::warning::tests/fixtures is not in the repo, so the golden tests were NOT run here. Run check-contracts.cmd on your PC first."
+            python -c "import ast,glob; [ast.parse(open(f,encoding='utf-8').read()) for f in glob.glob('con_*/*.py')]; print('syntax ok')"
+          fi
+
+      - name: Build
+        run: |
+          rm -rf build && mkdir -p build
+          cp contract-pipeline/catalyst.json build/
+          for fn in con_api con_worker; do
+            mkdir -p "build/functions/$fn"
+            find "contract-pipeline/$fn" -maxdepth 1 -type f ! -name write_back.py ! -name '*.bak-*' \
+              -exec cp {} "build/functions/$fn/" \;
+            cp "contract-pipeline/fn_config/$fn.json" "build/functions/$fn/catalyst-config.json"
+          done
+          # PDF / Word / Excel readers as Linux wheels for the worker
+          python -m pip install --quiet --target build/functions/con_worker \
+            --platform manylinux2014_x86_64 --python-version 3.9 --implementation cp \
+            --only-binary=:all: --no-warn-conflicts \
+            "pdfminer.six==20250506" "pdfplumber==0.11.7" "python-docx==1.2.0" "openpyxl==3.1.5"
+          for fn in con_api con_worker; do
+            rm -rf "build/functions/$fn/bin"
+            find "build/functions/$fn" -type d -name __pycache__ -prune -exec rm -rf {} +
+          done
+
+      - name: Inject credentials
+        env:
+          ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
+          ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+          ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+          ZOHO_ACCOUNTS_URL: ${{ secrets.ZOHO_ACCOUNTS_URL }}
+          ZOHO_API_DOMAIN: ${{ secrets.ZOHO_API_DOMAIN }}
+          CON_PIPELINE_TOKEN: ${{ secrets.CON_PIPELINE_TOKEN }}
+        run: python ci/inject_env.py contract build
+
+      - name: Deploy to Catalyst
+        working-directory: build
+        env:
+          CATALYST_TOKEN: ${{ secrets.CATALYST_TOKEN }}
+        run: |
+          catalyst config:set python3_9.bin="$(which python)"
+          catalyst deploy --only functions --project "$CATALYST_PROJECT_ID" --token "$CATALYST_TOKEN"

@@ -1,0 +1,7 @@
+{
+	"functions": {
+		"targets": ["con_api", "con_worker"],
+		"ignore": [],
+		"source": "functions"
+	}
+}
